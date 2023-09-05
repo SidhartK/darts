@@ -812,9 +812,10 @@ class TimeSeries:
         # split df by groups, and store group values and static values (static covariates)
         # single elements group columns must be unpacked for same groupby() behavior across different pandas versions
         splits = []
-        for static_cov_vals, group in df.groupby(
-            group_cols[0] if len(group_cols) == 1 else group_cols
-        ):
+        groupby_iter = df.groupby(group_cols[0] if len(group_cols) == 1 else group_cols)
+        if verbose:
+            groupby_iter = tqdm(groupby_iter, desc="TimeSeries.from_group_dataframe: Creating splits")
+        for static_cov_vals, group in groupby_iter:
             static_cov_vals = (
                 (static_cov_vals,)
                 if not isinstance(static_cov_vals, tuple)
