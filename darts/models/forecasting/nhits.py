@@ -2,6 +2,7 @@
 N-HiTS
 ------
 """
+## ENTIRE FILE MODIFIED by SidhartKrishnanQC
 
 from typing import List, Optional, Tuple, Union
 
@@ -11,10 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from darts.logging import get_logger, raise_if_not
-from darts.models.forecasting.pl_forecasting_module import (
-    PLPastCovariatesModule,
-    io_processor,
-)
+from darts.models.forecasting.pl_forecasting_module import PLPastCovariatesModule
 from darts.models.forecasting.torch_forecasting_model import PastCovariatesTorchModel
 from darts.utils.torch import MonteCarloDropout
 
@@ -38,12 +36,15 @@ class _Block(nn.Module):
     def __init__(
         self,
         input_chunk_length: int,
+        static_input_chunk_length: int,
         output_chunk_length: int,
         num_layers: int,
         layer_width: int,
+        input_dim: int,
         nr_params: int,
-        pooling_kernel_size: int,
+        pooling_kernel_size: Union[int, None],
         n_freq_downsample: int,
+        align_corners_downsample: bool,
         batch_norm: bool,
         dropout: float,
         activation: str,
@@ -98,13 +99,22 @@ class _Block(nn.Module):
         self.num_layers = num_layers
         self.layer_width = layer_width
         self.input_chunk_length = input_chunk_length
+        self.static_input_chunk_length = static_input_chunk_length
         self.output_chunk_length = output_chunk_length
+        self.input_dim = input_dim
         self.nr_params = nr_params
         self.pooling_kernel_size = pooling_kernel_size
         self.n_freq_downsample = n_freq_downsample
+        self.align_corners_downsample = align_corners_downsample
         self.batch_norm = batch_norm
         self.dropout = dropout
         self.MaxPool1d = MaxPool1d
+
+        ## SidhartKrishnanQC
+        # downsample_backcast = True
+        # downsample_forecast = False
+        # self.downsample_backcast = downsample_backcast
+        # self.downsample_forecast = downsample_forecast
 
         raise_if_not(
             activation in ACTIVATIONS, f"'{activation}' is not in {ACTIVATIONS}"
@@ -128,18 +138,27 @@ class _Block(nn.Module):
         src/models/nhits/nhits.py#L66
         """
         n_theta_backcast = max(input_chunk_length // n_freq_downsample, 1)
-        n_theta_forecast = max(output_chunk_length // n_freq_downsample, 1)
+                                    ## if downsample_backcast else input_chunk_length
+
+        n_theta_forecast = max(output_chunk_length // n_freq_downsample, 1)  
+                                    ## if downsample_backcast else output_chunk_length
+
 
         # entry pooling layer
-        pool1d = nn.MaxPool1d if self.MaxPool1d else nn.AvgPool1d
-        self.pooling_layer = pool1d(
-            kernel_size=self.pooling_kernel_size,
-            stride=self.pooling_kernel_size,
-            ceil_mode=True,
-        )
+        self.pooling_layer = None
+        if self.pooling_kernel_size is not None:
+            pool1d = nn.MaxPool1d if self.MaxPool1d else nn.AvgPool1d
+            self.pooling_layer = pool1d(
+                kernel_size=self.pooling_kernel_size,
+                stride=self.pooling_kernel_size,
+                ceil_mode=True,
+            )
+        
 
         # layer widths
-        in_len = int(np.ceil(input_chunk_length / pooling_kernel_size))
+        in_len = (input_chunk_length * input_dim) + static_input_chunk_length
+        if self.pooling_layer is not None:
+            in_len = int(np.ceil(in_len / pooling_kernel_size))
         self.layer_widths = [in_len] + [self.layer_width] * self.num_layers
 
         # FC layers
@@ -164,18 +183,21 @@ class _Block(nn.Module):
         # Fully connected layer producing forecast/backcast expansion coefficients (waveform generator parameters).
         # The coefficients are emitted for each parameter of the likelihood for the forecast.
         self.backcast_linear_layer = nn.Linear(
-            in_features=layer_width, out_features=n_theta_backcast
+            in_features=layer_width, out_features=input_dim * n_theta_backcast
         )
         self.forecast_linear_layer = nn.Linear(
             in_features=layer_width, out_features=nr_params * n_theta_forecast
         )
 
-    def forward(self, x):
+    def forward(self, x, x_static=None):
+        if x_static is not None:
+            x = torch.cat([x, x_static], dim=-1)
         batch_size = x.shape[0]
 
         # pooling
         x = x.unsqueeze(1)
-        x = self.pooling_layer(x)
+        if self.pooling_layer is not None:
+            x = self.pooling_layer(x)
         x = x.squeeze(1)
 
         # fully connected layer stack
@@ -189,21 +211,23 @@ class _Block(nn.Module):
         theta_forecast = theta_forecast.view(batch_size, self.nr_params, -1)
 
         # interpolate function expects (batch, "channels", time)
-        theta_backcast = theta_backcast.unsqueeze(1)
+        # theta_backcast = theta_backcast.unsqueeze(1)
+        theta_backcast = theta_backcast.view(batch_size, self.input_dim, -1)    ## Added SidhartKrishnanQC
 
         # interpolate both backcast and forecast from the thetas
         x_hat = F.interpolate(
-            theta_backcast, size=self.input_chunk_length, mode="linear"
-        )
-        y_hat = F.interpolate(
-            theta_forecast, size=self.output_chunk_length, mode="linear"
+            theta_backcast, size=self.input_chunk_length, mode="linear", align_corners=self.align_corners_downsample
         )
 
-        x_hat = x_hat.squeeze(1)  # remove 2nd dim we added before interpolation
+        y_hat = F.interpolate(
+            theta_forecast, size=self.output_chunk_length, mode="linear", align_corners=self.align_corners_downsample
+        ) 
+
+        x_hat = torch.reshape(x_hat, (batch_size, self.input_chunk_length * self.input_dim)) ## SidhartKrishnanQC
+        # x_hat = x_hat.squeeze(1)  # remove 2nd dim we added before interpolation
 
         # Set the distribution parameters as the last dimension
         y_hat = y_hat.reshape(x.shape[0], self.output_chunk_length, self.nr_params)
-
         return x_hat, y_hat
 
 
@@ -211,13 +235,16 @@ class _Stack(nn.Module):
     def __init__(
         self,
         input_chunk_length: int,
+        static_input_chunk_length: int, 
         output_chunk_length: int,
         num_blocks: int,
         num_layers: int,
         layer_width: int,
+        input_dim: int,
         nr_params: int,
-        pooling_kernel_sizes: Tuple[int],
+        pooling_kernel_sizes: Tuple[Union[int, None]],
         n_freq_downsample: Tuple[int],
+        align_corners_downsample: bool,
         batch_norm: bool,
         dropout: float,
         activation: str,
@@ -269,19 +296,24 @@ class _Stack(nn.Module):
         super().__init__()
 
         self.input_chunk_length = input_chunk_length
+        self.static_input_chunk_length = static_input_chunk_length
         self.output_chunk_length = output_chunk_length
+        self.input_dim = input_dim
         self.nr_params = nr_params
 
         # TODO: leave option to share weights across blocks?
         self.blocks_list = [
             _Block(
                 input_chunk_length,
+                static_input_chunk_length,
                 output_chunk_length,
                 num_layers,
                 layer_width,
+                input_dim,
                 nr_params,
                 pooling_kernel_sizes[i],
                 n_freq_downsample[i],
+                align_corners_downsample,
                 batch_norm=(
                     batch_norm and i == 0
                 ),  # batch norm only on first block of first stack
@@ -293,7 +325,7 @@ class _Stack(nn.Module):
         ]
         self.blocks = nn.ModuleList(self.blocks_list)
 
-    def forward(self, x):
+    def forward(self, x, x_static=None):
         # One forecast vector per parameter in the distribution
         stack_forecast = torch.zeros(
             x.shape[0],
@@ -305,7 +337,7 @@ class _Stack(nn.Module):
 
         for block in self.blocks_list:
             # pass input through block
-            x_hat, y_hat = block(x)
+            x_hat, y_hat = block(x, x_static)
 
             # add block forecast to stack forecast
             stack_forecast = stack_forecast + y_hat
@@ -322,14 +354,16 @@ class _NHiTSModule(PLPastCovariatesModule):
     def __init__(
         self,
         input_dim: int,
+        static_input_dim: int,
         output_dim: int,
         nr_params: int,
         num_stacks: int,
         num_blocks: int,
         num_layers: int,
         layer_widths: List[int],
-        pooling_kernel_sizes: Tuple[Tuple[int]],
+        pooling_kernel_sizes: Tuple[Tuple[Union[int, None]]],
         n_freq_downsample: Tuple[Tuple[int]],
+        align_corners_downsample: bool,
         batch_norm: bool,
         dropout: float,
         activation: str,
@@ -374,7 +408,7 @@ class _NHiTSModule(PLPastCovariatesModule):
 
         Inputs
         ------
-        x of shape `(batch_size, input_chunk_length)`
+        x of shape `(batch_size, input_chunk_length)` w/ first (:, :output_dim) features being the 
             Tensor containing the input sequence.
 
         Outputs
@@ -384,25 +418,32 @@ class _NHiTSModule(PLPastCovariatesModule):
 
         """
         super().__init__(**kwargs)
-
         self.input_dim = input_dim
+        self.static_input_dim = static_input_dim
         self.output_dim = output_dim
+        # self.skip_dim = input_dim - output_dim    ## Added SidhartKrishnanQC
         self.nr_params = nr_params
-        self.input_chunk_length_multi = self.input_chunk_length * input_dim
+        # self.input_chunk_length_multi = self.input_chunk_length * input_dim
+        self.input_chunk_length_multi = self.input_chunk_length     ## Added SidhartKrishnanQC
 
-        # TODO: shouldn't this be output_dim?
-        self.output_chunk_length_multi = self.output_chunk_length * input_dim
+        # TODO: shouldn't this be output_dim? (Turns out nope because the self.output_chunk_length_mutli is the output dim of the backcast)
+        # self.output_chunk_length_multi = self.output_chunk_length * input_dim
+        self.output_chunk_length_multi = self.output_chunk_length * output_dim ## Added SidhartKrishnanQC 
+                                    ## (no longer use bad so self.output_chunk_length_multi is only output dim of forecast)
 
         self.stacks_list = [
             _Stack(
                 self.input_chunk_length_multi,
+                self.static_input_dim,
                 self.output_chunk_length_multi,
                 num_blocks,
                 num_layers,
                 layer_widths[i],
+                input_dim,
                 nr_params,
                 pooling_kernel_sizes[i],
                 n_freq_downsample[i],
+                align_corners_downsample,
                 batch_norm=(
                     batch_norm and i == 0
                 ),  # batch norm only on first block of first stack
@@ -420,13 +461,13 @@ class _NHiTSModule(PLPastCovariatesModule):
         # on this params (the last block backcast is not part of the final output of the net).
         self.stacks_list[-1].blocks[-1].backcast_linear_layer.requires_grad_(False)
 
-    @io_processor
     def forward(self, x_in: Tuple):
-        x, _ = x_in
+        x, x_static = x_in         
 
         # if x1, x2,... y1, y2... is one multivariate ts containing x and y, and a1, a2... one covariate ts
         # we reshape into x1, y1, a1, x2, y2, a2... etc
-        x = torch.reshape(x, (x.shape[0], self.input_chunk_length_multi, 1))
+        x = torch.reshape(x, (x.shape[0], self.input_chunk_length_multi * self.input_dim, 1))
+        x_static = torch.reshape(x_static, (x_static.shape[0], self.static_input_dim))
         # squeeze last dimension (because model is univariate)
         x = x.squeeze(dim=2)
 
@@ -441,7 +482,7 @@ class _NHiTSModule(PLPastCovariatesModule):
 
         for stack in self.stacks_list:
             # compute stack output
-            stack_residual, stack_forecast = stack(x)
+            stack_residual, stack_forecast = stack(x, x_static)
 
             # add stack forecast to final output
             y = y + stack_forecast
@@ -453,9 +494,10 @@ class _NHiTSModule(PLPastCovariatesModule):
         # We want to reshape to original format. We also get rid of the covariates and keep only the target dimensions.
         # The covariates are by construction added as extra time series on the right side. So we need to get rid of this
         # right output (keeping only :self.output_dim).
-        y = y.view(
-            y.shape[0], self.output_chunk_length, self.input_dim, self.nr_params
-        )[:, :, : self.output_dim, :]
+        # y = y.view(
+        #     y.shape[0], self.output_chunk_length, self.input_dim, self.nr_params
+        # )[:, :, : self.output_dim, :]
+        y = y.view(y.shape[0], self.output_chunk_length, self.output_dim, self.nr_params)
 
         return y
 
@@ -469,8 +511,9 @@ class NHiTSModel(PastCovariatesTorchModel):
         num_blocks: int = 1,
         num_layers: int = 2,
         layer_widths: Union[int, List[int]] = 512,
-        pooling_kernel_sizes: Optional[Tuple[Tuple[int]]] = None,
+        pooling_kernel_sizes: Optional[Union[Tuple[Tuple[Union[int, None]]], bool]] = None,
         n_freq_downsample: Optional[Tuple[Tuple[int]]] = None,
+        align_corners_downsample: bool = True,
         dropout: float = 0.1,
         activation: str = "ReLU",
         MaxPool1d: bool = True,
@@ -556,9 +599,6 @@ class NHiTSModel(PastCovariatesTorchModel):
             to using a constant learning rate. Default: ``None``.
         lr_scheduler_kwargs
             Optionally, some keyword arguments for the PyTorch learning rate scheduler. Default: ``None``.
-        use_reversible_instance_norm
-            Whether to use reversible instance normalization `RINorm` against distribution shift as shown in [2]_.
-            It is only applied to the features of the target series and not the covariates.
         batch_size
             Number of time series (input and output sequences) used in each training pass. Default: ``32``.
         n_epochs
@@ -599,14 +639,11 @@ class NHiTSModel(PastCovariatesTorchModel):
             .. highlight:: python
             .. code-block:: python
 
-                def encode_year(idx):
-                    return (idx.year - 1950) / 50
-
                 add_encoders={
                     'cyclic': {'future': ['month']},
                     'datetime_attribute': {'future': ['hour', 'dayofweek']},
                     'position': {'past': ['relative'], 'future': ['relative']},
-                    'custom': {'past': [encode_year]},
+                    'custom': {'past': [lambda idx: (idx.year - 1950) / 50]},
                     'transformer': Scaler()
                 }
             ..
@@ -669,13 +706,12 @@ class NHiTSModel(PastCovariatesTorchModel):
         ----------
         .. [1] C. Challu et al. "N-HiTS: Neural Hierarchical Interpolation for Time Series Forecasting",
                https://arxiv.org/abs/2201.12886
-        .. [2] T. Kim et al. "Reversible Instance Normalization for Accurate Time-Series Forecasting against
-                Distribution Shift", https://openreview.net/forum?id=cGDAkQo1C0p
         """
         super().__init__(**self._extract_torch_model_params(**self.model_params))
 
         # extract pytorch lightning module kwargs
         self.pl_module_params = self._extract_pl_module_params(**self.model_params)
+        self._uses_static_covariates = True
 
         raise_if_not(
             isinstance(layer_widths, int) or len(layer_widths) == num_stacks,
@@ -706,6 +742,7 @@ class NHiTSModel(PastCovariatesTorchModel):
             num_stacks,
         )
         self.pooling_kernel_sizes, self.n_freq_downsample = sizes
+        self.align_corners_downsample = align_corners_downsample    ## Added by SidhartKrishnanQC
 
         if isinstance(layer_widths, int):
             self.layer_widths = [layer_widths] * self.num_stacks
@@ -727,21 +764,30 @@ class NHiTSModel(PastCovariatesTorchModel):
                 all([len(i) == num_blocks for i in tup]),
                 f"the length of each tuple in {name} must be `num_blocks={num_blocks}`",
             )
-
-        if pooling_kernel_sizes is None:
-            # make stacks handle different frequencies
-            # go from in_len/2 to 1 in num_stacks steps:
+        if pooling_kernel_sizes is False:
             max_v = max(in_len // 2, 1)
             pooling_kernel_sizes = tuple(
-                (int(v),) * num_blocks
+                (None,) * num_blocks
                 for v in max_v // np.geomspace(1, max_v, num_stacks)
             )
             logger.info(
-                f"(N-HiTS): Using automatic kernel pooling size: {pooling_kernel_sizes}."
+                f"(N-HiTS): Not using any pooling."
             )
         else:
-            # check provided pooling format
-            _check_sizes(pooling_kernel_sizes, "`pooling_kernel_sizes`")
+            if pooling_kernel_sizes is None:
+                # make stacks handle different frequencies
+                # go from in_len/2 to 1 in num_stacks steps:
+                max_v = max(in_len // 2, 1)
+                pooling_kernel_sizes = tuple(
+                    (int(v),) * num_blocks
+                    for v in max_v // np.geomspace(1, max_v, num_stacks)
+                )
+                logger.info(
+                    f"(N-HiTS): Using automatic kernel pooling size: {pooling_kernel_sizes}."
+                )
+            else:
+                # check provided pooling format
+                _check_sizes(pooling_kernel_sizes, "`pooling_kernel_sizes`")
 
         if n_freq_downsample is None:
             # go from out_len/2 to 1 in num_stacks steps:
@@ -771,11 +817,13 @@ class NHiTSModel(PastCovariatesTorchModel):
         input_dim = train_sample[0].shape[1] + (
             train_sample[1].shape[1] if train_sample[1] is not None else 0
         )
+        static_input_dim = train_sample[2].shape[1] if train_sample[2] is not None else 0
         output_dim = train_sample[-1].shape[1]
         nr_params = 1 if self.likelihood is None else self.likelihood.num_parameters
 
         return _NHiTSModule(
             input_dim=input_dim,
+            static_input_dim=static_input_dim,
             output_dim=output_dim,
             nr_params=nr_params,
             num_stacks=self.num_stacks,
@@ -784,9 +832,11 @@ class NHiTSModel(PastCovariatesTorchModel):
             layer_widths=self.layer_widths,
             pooling_kernel_sizes=self.pooling_kernel_sizes,
             n_freq_downsample=self.n_freq_downsample,
+            align_corners_downsample=self.align_corners_downsample,
             batch_norm=self.batch_norm,
             dropout=self.dropout,
             activation=self.activation,
             MaxPool1d=self.MaxPool1d,
             **self.pl_module_params,
         )
+

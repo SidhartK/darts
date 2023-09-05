@@ -46,6 +46,7 @@ import matplotlib.axes
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 import xarray as xr
 from pandas.tseries.frequencies import to_offset
 from scipy.stats import kurtosis, skew
@@ -738,6 +739,7 @@ class TimeSeries:
         fill_missing_dates: Optional[bool] = False,
         freq: Optional[Union[str, int]] = None,
         fillna_value: Optional[float] = None,
+        verbose: bool = False
     ) -> List["TimeSeries"]:
         """
         Build a list of TimeSeries instances grouped by a selection of columns from a DataFrame.
@@ -846,7 +848,9 @@ class TimeSeries:
                     group.drop(columns=static_cov_cols),
                 )
             )
-
+        if verbose:
+            print("TimeSeries.from_group_dataframe: Created splits")
+            splits = tqdm(splits, desc="TimeSeries.from_group_dataframe: Iterating through splits")
         # create a list with multiple TimeSeries and add static covariates
         return [
             TimeSeries.from_dataframe(

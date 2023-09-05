@@ -195,6 +195,7 @@ class LightGBMModel(RegressionModelWithCategoricalCovariates, _LikelihoodMixin):
                 past_covariates=val_past_covariates,
                 future_covariates=val_future_covariates,
                 max_samples_per_ts=max_samples_per_ts,
+                uses_static_covariates=True,
             )
 
         if self.likelihood == "quantile":

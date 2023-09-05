@@ -862,10 +862,11 @@ def _create_lagged_data_by_moving_window(
             # If `start_time` not included in `time_index_i`, can 'manually' calculate
             # what its index *would* be if `time_index_i` were extended to include that time:
             if not is_target_series and (time_index_i[-1] <= start_time):
+                to_period_freq = 'M' if series_i.freq == 'MS' else series_i.freq
                 start_time_idx = (
                     len(time_index_i)
                     - 1
-                    + (start_time - time_index_i[-1]) // series_i.freq
+                    + (start_time.to_period(to_period_freq) - time_index_i[-1].to_period(to_period_freq)).n
                 )
             elif not is_target_series and (time_index_i[0] >= start_time):
                 start_time_idx = max_lag_i

@@ -362,7 +362,7 @@ class RegressionModel(GlobalForecastingModel):
         return last_valid_pred_time
 
     def _create_lagged_data(
-        self, target_series, past_covariates, future_covariates, max_samples_per_ts
+        self, target_series, past_covariates, future_covariates, max_samples_per_ts, uses_static_covariates=False,
     ):
         lags = self.lags.get("target")
         lags_past_covariates = self.lags.get("past")
@@ -381,7 +381,7 @@ class RegressionModel(GlobalForecastingModel):
             lags=lags,
             lags_past_covariates=lags_past_covariates,
             lags_future_covariates=lags_future_covariates,
-            uses_static_covariates=self.uses_static_covariates,
+            uses_static_covariates=(uses_static_covariates or self.uses_static_covariates),
             last_static_covariates_shape=None,
             max_samples_per_ts=max_samples_per_ts,
             multi_models=self.multi_models,
