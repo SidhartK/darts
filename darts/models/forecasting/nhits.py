@@ -43,12 +43,15 @@ class _Block(nn.Module):
         input_dim: int,
         nr_params: int,
         pooling_kernel_size: Union[int, None],
+        pooling_stride: Union[int, None],
+        pooling_output_dim: Union[int, None],
+        pooling_ngroup: Union[int, None],
         n_freq_downsample: int,
         align_corners_downsample: bool,
         batch_norm: bool,
         dropout: float,
         activation: str,
-        MaxPool1d: bool,
+        pooling_layer_name: Union[str, None],
     ):
         """PyTorch module implementing the basic building block of the N-HiTS architecture.
 
@@ -104,17 +107,14 @@ class _Block(nn.Module):
         self.input_dim = input_dim
         self.nr_params = nr_params
         self.pooling_kernel_size = pooling_kernel_size
+        self.pooling_stride = pooling_stride if pooling_stride is not None else pooling_kernel_size
+        self.pooling_output_dim = pooling_output_dim if pooling_output_dim is not None else input_dim
+        self.pooling_ngroup = pooling_ngroup if pooling_ngroup is not None else 1
         self.n_freq_downsample = n_freq_downsample
         self.align_corners_downsample = align_corners_downsample
         self.batch_norm = batch_norm
         self.dropout = dropout
-        self.MaxPool1d = MaxPool1d
-
-        ## SidhartKrishnanQC
-        # downsample_backcast = True
-        # downsample_forecast = False
-        # self.downsample_backcast = downsample_backcast
-        # self.downsample_forecast = downsample_forecast
+        self.pooling_layer_name = pooling_layer_name
 
         raise_if_not(
             activation in ACTIVATIONS, f"'{activation}' is not in {ACTIVATIONS}"
@@ -146,19 +146,32 @@ class _Block(nn.Module):
 
         # entry pooling layer
         self.pooling_layer = None
-        if self.pooling_kernel_size is not None:
-            pool1d = nn.MaxPool1d if self.MaxPool1d else nn.AvgPool1d
-            self.pooling_layer = pool1d(
-                kernel_size=self.pooling_kernel_size,
-                stride=self.pooling_kernel_size,
-                ceil_mode=True,
-            )
+        if self.pooling_layer_name is not None and self.pooling_kernel_size is not None:
+            if self.pooling_layer_name == "MaxPool1d":
+                self.pooling_layer = nn.MaxPool1d(
+                                            kernel_size=self.pooling_kernel_size, 
+                                            stride=self.pooling_stride, 
+                                            ceil_mode=True
+                                        )
+            elif self.pooling_layer_name == "Conv1d":
+                self.pooling_layer = nn.Conv1d(
+                                            in_channels=input_dim,
+                                            out_channels=self.pooling_output_dim,
+                                            kernel_size=self.pooling_kernel_size,
+                                            stride=self.pooling_stride,
+                                            groups=self.pooling_ngroup,
+                                        )
         
 
         # layer widths
-        in_len = (input_chunk_length * input_dim) + static_input_chunk_length
         if self.pooling_layer is not None:
-            in_len = int(np.ceil(in_len / pooling_kernel_size))
+            if self.pooling_layer_name == "MaxPool1d":
+                input_chunk_length = int(np.ceil(((input_chunk_length - self.pooling_kernel_size)/self.pooling_stride) + 1))
+            elif self.pooling_layer_name == "Conv1d":
+                input_chunk_length = int(np.floor(((input_chunk_length - self.pooling_kernel_size)/self.pooling_stride) + 1))
+                input_dim = self.pooling_output_dim
+
+        in_len = (input_chunk_length * input_dim) + static_input_chunk_length
         self.layer_widths = [in_len] + [self.layer_width] * self.num_layers
 
         # FC layers
@@ -190,15 +203,16 @@ class _Block(nn.Module):
         )
 
     def forward(self, x, x_static=None):
-        if x_static is not None:
-            x = torch.cat([x, x_static], dim=-1)
         batch_size = x.shape[0]
 
         # pooling
-        x = x.unsqueeze(1)
         if self.pooling_layer is not None:
+            x = x.view(batch_size, self.input_dim, -1)
             x = self.pooling_layer(x)
-        x = x.squeeze(1)
+            x = torch.flatten(x, start_dim=1)
+
+        if x_static is not None:
+            x = torch.cat([x, x_static], dim=-1)
 
         # fully connected layer stack
         x = self.layers(x)
@@ -243,12 +257,15 @@ class _Stack(nn.Module):
         input_dim: int,
         nr_params: int,
         pooling_kernel_sizes: Tuple[Union[int, None]],
+        pooling_strides: Tuple[Union[int, None]],
+        pooling_output_dims: Tuple[Union[int, None]],
+        pooling_groups: Tuple[Union[int, None]],
         n_freq_downsample: Tuple[int],
         align_corners_downsample: bool,
         batch_norm: bool,
         dropout: float,
         activation: str,
-        MaxPool1d: bool,
+        pooling_layer_name: Union[str, None],
     ):
         """PyTorch module implementing one stack of the N-BEATS architecture that comprises multiple basic blocks.
 
@@ -312,6 +329,9 @@ class _Stack(nn.Module):
                 input_dim,
                 nr_params,
                 pooling_kernel_sizes[i],
+                pooling_strides[i],
+                pooling_output_dims[i],
+                pooling_groups[i],
                 n_freq_downsample[i],
                 align_corners_downsample,
                 batch_norm=(
@@ -319,7 +339,7 @@ class _Stack(nn.Module):
                 ),  # batch norm only on first block of first stack
                 dropout=dropout,
                 activation=activation,
-                MaxPool1d=MaxPool1d,
+                pooling_layer_name=pooling_layer_name,
             )
             for i in range(num_blocks)
         ]
@@ -362,12 +382,15 @@ class _NHiTSModule(PLPastCovariatesModule):
         num_layers: int,
         layer_widths: List[int],
         pooling_kernel_sizes: Tuple[Tuple[Union[int, None]]],
+        pooling_strides: Tuple[Tuple[Union[int, None]]],
+        pooling_output_dims: Tuple[Tuple[Union[int, None]]],
+        pooling_groups: Tuple[Tuple[Union[int, None]]],
         n_freq_downsample: Tuple[Tuple[int]],
         align_corners_downsample: bool,
         batch_norm: bool,
         dropout: float,
         activation: str,
-        MaxPool1d: bool,
+        pooling_layer_name: Union[str, None],
         **kwargs,
     ):
         """PyTorch module implementing the N-HiTS architecture.
@@ -442,6 +465,9 @@ class _NHiTSModule(PLPastCovariatesModule):
                 input_dim,
                 nr_params,
                 pooling_kernel_sizes[i],
+                pooling_strides[i],
+                pooling_output_dims[i],
+                pooling_groups[i],
                 n_freq_downsample[i],
                 align_corners_downsample,
                 batch_norm=(
@@ -511,12 +537,15 @@ class NHiTSModel(PastCovariatesTorchModel):
         num_blocks: int = 1,
         num_layers: int = 2,
         layer_widths: Union[int, List[int]] = 512,
-        pooling_kernel_sizes: Optional[Union[Tuple[Tuple[Union[int, None]]], bool]] = None,
+        pooling_kernel_sizes: Optional[Tuple[Tuple[Union[int, None]]]] = None,
+        pooling_strides: Optional[Tuple[Tuple[Union[int, None]]]] = None,
+        min_pooling_reduction: Optional[int] = None,
         n_freq_downsample: Optional[Tuple[Tuple[int]]] = None,
+        min_downsample_reduction: Optional[int] = None,
         align_corners_downsample: bool = True,
         dropout: float = 0.1,
         activation: str = "ReLU",
-        MaxPool1d: bool = True,
+        pooling_layer_name: Union[str, None] = None,
         **kwargs,
     ):
         """An implementation of the N-HiTS model, as presented in [1]_.
@@ -725,7 +754,13 @@ class NHiTSModel(PastCovariatesTorchModel):
         self.num_layers = num_layers
         self.layer_widths = layer_widths
         self.activation = activation
-        self.MaxPool1d = MaxPool1d
+        self.pooling_layer_name = pooling_layer_name
+
+        if pooling_layer_name is not None:
+            if pooling_kernel_sizes is None:
+                pooling_kernel_sizes = "geometric"
+            if pooling_strides is None:
+                pooling_strides = "one"
 
         # Currently batch norm is not an option as it seems to perform badly
         self.batch_norm = False
@@ -735,13 +770,16 @@ class NHiTSModel(PastCovariatesTorchModel):
         # Check pooling and downsampling numbers or compute good defaults
         sizes = self._prepare_pooling_downsampling(
             pooling_kernel_sizes,
+            pooling_strides,
             n_freq_downsample,
             self.input_chunk_length,
             self.output_chunk_length,
             num_blocks,
             num_stacks,
+            min_pooling_reduction,
+            min_downsample_reduction,
         )
-        self.pooling_kernel_sizes, self.n_freq_downsample = sizes
+        (self.pooling_kernel_sizes, self.pooling_strides), self.n_freq_downsample = sizes
         self.align_corners_downsample = align_corners_downsample    ## Added by SidhartKrishnanQC
 
         if isinstance(layer_widths, int):
@@ -753,7 +791,15 @@ class NHiTSModel(PastCovariatesTorchModel):
 
     @staticmethod
     def _prepare_pooling_downsampling(
-        pooling_kernel_sizes, n_freq_downsample, in_len, out_len, num_blocks, num_stacks
+        pooling_kernel_sizes,
+        pooling_strides, 
+        n_freq_downsample, 
+        in_len, 
+        out_len, 
+        num_blocks, 
+        num_stacks, 
+        min_pooling_reduction,
+        min_downsample_reduction,
     ):
         def _check_sizes(tup, name):
             raise_if_not(
@@ -764,40 +810,89 @@ class NHiTSModel(PastCovariatesTorchModel):
                 all([len(i) == num_blocks for i in tup]),
                 f"the length of each tuple in {name} must be `num_blocks={num_blocks}`",
             )
-        if pooling_kernel_sizes is False:
-            max_v = max(in_len // 2, 1)
+        min_pooling_reduction = min_pooling_reduction if min_pooling_reduction is not None else 2
+        min_downsample_reduction = min_downsample_reduction if min_downsample_reduction is not None else 2
+
+        if pooling_kernel_sizes is None:
             pooling_kernel_sizes = tuple(
                 (None,) * num_blocks
-                for v in max_v // np.geomspace(1, max_v, num_stacks)
+                for _ in range(num_stacks)
+            )
+        elif pooling_kernel_sizes == "geometric":
+            # make stacks handle different frequencies
+            # go from in_len/2 to 1 in num_stacks steps:
+            max_v = max(in_len // min_pooling_reduction, 1)
+            pooling_kernel_sizes = tuple(
+                (int(v),) * num_blocks
+                for v in np.geomspace(max_v, 1, num_stacks)
             )
             logger.info(
-                f"(N-HiTS): Not using any pooling."
+                f"(N-HiTS): Using automatic kernel pooling size: {pooling_kernel_sizes}."
+            )
+        elif pooling_kernel_sizes == "linear":
+            # make stacks handle different frequencies
+            # go from in_len/2 to 1 in num_stacks steps:
+            max_v = max(in_len // min_pooling_reduction, 1)
+            pooling_kernel_sizes = tuple(
+                (int(v),) * num_blocks
+                for v in np.linspace(max_v, 1, num_stacks)
+            )
+            logger.info(
+                f"(N-HiTS): Using automatic kernel pooling size: {pooling_kernel_sizes}."
             )
         else:
-            if pooling_kernel_sizes is None:
-                # make stacks handle different frequencies
-                # go from in_len/2 to 1 in num_stacks steps:
-                max_v = max(in_len // 2, 1)
-                pooling_kernel_sizes = tuple(
-                    (int(v),) * num_blocks
-                    for v in max_v // np.geomspace(1, max_v, num_stacks)
-                )
-                logger.info(
-                    f"(N-HiTS): Using automatic kernel pooling size: {pooling_kernel_sizes}."
-                )
-            else:
-                # check provided pooling format
-                _check_sizes(pooling_kernel_sizes, "`pooling_kernel_sizes`")
-
-        if n_freq_downsample is None:
-            # go from out_len/2 to 1 in num_stacks steps:
-            max_v = max(out_len // 2, 1)
-            n_freq_downsample = tuple(
-                (int(v),) * num_blocks
-                for v in max_v // np.geomspace(1, max_v, num_stacks)
+            # check provided pooling format
+            _check_sizes(pooling_kernel_sizes, "`pooling_kernel_sizes`")
+        
+        if pooling_strides is None:
+            pooling_strides = tuple(
+                (None,) * num_blocks
+                for _ in range(num_stacks)
+            )
+        elif pooling_strides == "kernel":
+            pooling_strides = pooling_kernel_sizes
+            logger.info(
+                f"(N-HiTS): Using automatic pooling strides: {pooling_strides}."
+            )
+        elif pooling_strides == "one":
+            pooling_strides = tuple(
+                (1,) * num_blocks
+                for _ in range(num_stacks)
             )
             logger.info(
-                f"(N-HiTS):  Using automatic downsampling coefficients: {n_freq_downsample}."
+                f"(N-HiTS): Using automatic pooling strides: {pooling_strides}."
+            )
+        else:
+            # check provided pooling format
+            _check_sizes(pooling_strides, "`pooling_strides`")
+
+        if n_freq_downsample is None:
+            n_freq_downsample = tuple(
+                (1,) * num_blocks
+                for _ in range(num_stacks)
+            )
+            logger.info(
+                f"(N-HiTS): Using automatic downsampling coefficients: {n_freq_downsample}."
+            )
+        elif n_freq_downsample == "geometric":
+            # go from out_len/2 to 1 geometrically in num_stacks steps:
+            max_v = max(out_len // min_downsample_reduction, 1)
+            n_freq_downsample = tuple(
+                (int(v),) * num_blocks
+                for v in np.geomspace(max_v, 1, num_stacks)
+            )
+            logger.info(
+                f"(N-HiTS): Using automatic downsampling coefficients: {n_freq_downsample}."
+            )
+        elif n_freq_downsample == "linear":
+            # go from out_len/2 to 1 linearly in num_stacks steps:
+            max_v = max(out_len // min_downsample_reduction, 1)
+            n_freq_downsample = tuple(
+                (int(v),) * num_blocks
+                for v in np.linspace(max_v, 1, num_stacks)
+            )
+            logger.info(
+                f"(N-HiTS): Using automatic downsampling coefficients: {n_freq_downsample}."
             )
         else:
             # check provided downsample format
@@ -810,7 +905,7 @@ class NHiTSModel(PastCovariatesTorchModel):
                 + "(i.e., `n_freq_downsample[-1][-1]`).",
             )
 
-        return pooling_kernel_sizes, n_freq_downsample
+        return (pooling_kernel_sizes, pooling_strides), n_freq_downsample
 
     def _create_model(self, train_sample: Tuple[torch.Tensor]) -> torch.nn.Module:
         # samples are made of (past_target, past_covariates, future_target)
@@ -836,7 +931,7 @@ class NHiTSModel(PastCovariatesTorchModel):
             batch_norm=self.batch_norm,
             dropout=self.dropout,
             activation=self.activation,
-            MaxPool1d=self.MaxPool1d,
+            pooling_layer_name=self.pooling_layer_name,
             **self.pl_module_params,
         )
 
