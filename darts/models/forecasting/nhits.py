@@ -4,14 +4,15 @@ N-HiTS
 """
 ## ENTIRE FILE MODIFIED by SidhartKrishnanQC
 
-from typing import List, Optional, Tuple, Union
+from enum import Enum
+from typing import List, NewType, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from darts.logging import get_logger, raise_if_not
+from darts.logging import get_logger, raise_if_not, raise_log
 from darts.models.forecasting.pl_forecasting_module import PLPastCovariatesModule
 from darts.models.forecasting.torch_forecasting_model import PastCovariatesTorchModel
 from darts.utils.torch import MonteCarloDropout
@@ -31,6 +32,65 @@ ACTIVATIONS = [
     "GELU",
 ]
 
+class _GType(Enum):
+    GENERIC = 1
+    TREND = 2
+    SEASONALITY = 3
+
+
+GTypes = NewType("GTypes", _GType)
+
+
+class _TrendGenerator(nn.Module):
+    def __init__(self, expansion_coefficient_dim, target_length):
+        super().__init__()
+
+        # basis is of size (expansion_coefficient_dim, target_length)
+        basis = torch.stack(
+            [
+                (torch.arange(target_length) / target_length) ** i
+                for i in range(expansion_coefficient_dim)
+            ],
+            dim=1,
+        ).T
+
+        self.input_dim = expansion_coefficient_dim
+        self.target_length = target_length
+        self.basis = nn.Parameter(basis, requires_grad=False)
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+        x = x.view(-1, self.input_dim)
+        output = torch.matmul(x, self.basis)
+        return output.view(batch_size, -1)
+
+
+class _SeasonalityGenerator(nn.Module):
+    def __init__(self, target_length):
+        super().__init__()
+
+        half_minus_one = int(target_length / 2 - 1)
+        cos_vectors = [
+            torch.cos(torch.arange(target_length) / (target_length-1) * 2 * np.pi * i)
+            for i in range(1, half_minus_one + 1)
+        ]
+        sin_vectors = [
+            torch.sin(torch.arange(target_length) / (target_length-1) * 2 * np.pi * i)
+            for i in range(1, half_minus_one + 1)
+        ]
+        # basis is of size (2 * int(target_length / 2 - 1) + 1, target_length)
+        basis = torch.stack(
+            [torch.ones(target_length)] + cos_vectors + sin_vectors, dim=1
+        ).T
+
+        self.input_dim = 2 * half_minus_one + 1
+        self.target_length = target_length
+        self.basis = nn.Parameter(basis, requires_grad=False)
+
+    def forward(self, x):
+        x = x.view(-1, self.input_dim)
+        return torch.matmul(x, self.basis)
+
 
 class _Block(nn.Module):
     def __init__(
@@ -46,12 +106,15 @@ class _Block(nn.Module):
         pooling_stride: Union[int, None],
         pooling_output_dim: Union[int, None],
         pooling_ngroup: Union[int, None],
-        n_freq_downsample: int,
+        backcast_downsample_freq: int,
+        forecast_downsample_freq: int,
         align_corners_downsample: bool,
         batch_norm: bool,
         dropout: float,
         activation: str,
         pooling_layer_name: Union[str, None],
+        g_type: _GType,
+        expansion_coefficient_dim: int,
     ):
         """PyTorch module implementing the basic building block of the N-HiTS architecture.
 
@@ -110,7 +173,8 @@ class _Block(nn.Module):
         self.pooling_stride = pooling_stride if pooling_stride is not None else pooling_kernel_size
         self.pooling_output_dim = pooling_output_dim if pooling_output_dim is not None else input_dim
         self.pooling_ngroup = pooling_ngroup if pooling_ngroup is not None else 1
-        self.n_freq_downsample = n_freq_downsample
+        self.backcast_downsample_freq = backcast_downsample_freq
+        self.forecast_downsample_freq = forecast_downsample_freq
         self.align_corners_downsample = align_corners_downsample
         self.batch_norm = batch_norm
         self.dropout = dropout
@@ -137,10 +201,10 @@ class _Block(nn.Module):
         [2] https://github.com/cchallu/n-hits/blob/4e929ed31e1d3ff5169b4aa0d3762a0040abb8db/
         src/models/nhits/nhits.py#L66
         """
-        n_theta_backcast = max(input_chunk_length // n_freq_downsample, 1)
+        n_theta_backcast = max(input_chunk_length // backcast_downsample_freq, 1) + 1
                                     ## if downsample_backcast else input_chunk_length
 
-        n_theta_forecast = max(output_chunk_length // n_freq_downsample, 1)  
+        n_theta_forecast = max(output_chunk_length // forecast_downsample_freq, 1) + 1 
                                     ## if downsample_backcast else output_chunk_length
 
 
@@ -195,12 +259,33 @@ class _Block(nn.Module):
 
         # Fully connected layer producing forecast/backcast expansion coefficients (waveform generator parameters).
         # The coefficients are emitted for each parameter of the likelihood for the forecast.
-        self.backcast_linear_layer = nn.Linear(
-            in_features=layer_width, out_features=input_dim * n_theta_backcast
-        )
-        self.forecast_linear_layer = nn.Linear(
-            in_features=layer_width, out_features=nr_params * n_theta_forecast
-        )
+        if g_type == _GType.SEASONALITY:
+            self.backcast_linear_layer = nn.Linear(
+                in_features=layer_width, out_features=input_dim * (2 * int(n_theta_backcast / 2 - 1) + 1)
+            )
+            self.forecast_linear_layer = nn.Linear(
+                in_features=layer_width, out_features=nr_params * (2 * int(n_theta_forecast / 2 - 1) + 1)
+            )
+        else:
+            self.backcast_linear_layer = nn.Linear(
+                in_features=layer_width, out_features=input_dim * expansion_coefficient_dim
+            )
+            self.forecast_linear_layer = nn.Linear(
+                in_features=layer_width, out_features=nr_params * expansion_coefficient_dim
+            )
+
+        # waveform generator functions
+        if g_type == _GType.GENERIC:
+            self.backcast_g = nn.Linear(input_dim * expansion_coefficient_dim, input_dim * n_theta_backcast)
+            self.forecast_g = nn.Linear(nr_params * expansion_coefficient_dim, nr_params * n_theta_forecast)
+        elif g_type == _GType.TREND:
+            self.backcast_g = _TrendGenerator(expansion_coefficient_dim, n_theta_backcast)
+            self.forecast_g = _TrendGenerator(expansion_coefficient_dim, n_theta_forecast)
+        elif g_type == _GType.SEASONALITY:
+            self.backcast_g = _SeasonalityGenerator(n_theta_backcast)
+            self.forecast_g = _SeasonalityGenerator(n_theta_forecast)
+        else:
+            raise_log(ValueError("g_type not supported"), logger)
 
     def forward(self, x, x_static=None):
         batch_size = x.shape[0]
@@ -213,7 +298,6 @@ class _Block(nn.Module):
 
         if x_static is not None:
             x = torch.cat([x, x_static], dim=-1)
-
         # fully connected layer stack
         x = self.layers(x)
 
@@ -221,21 +305,23 @@ class _Block(nn.Module):
         theta_backcast = self.backcast_linear_layer(x)
         theta_forecast = self.forecast_linear_layer(x)
 
+        theta_backcast = self.backcast_g(theta_backcast)
+        theta_forecast = self.forecast_g(theta_forecast)
+
         # set the expansion coefs in last dimension for the forecasts
         theta_forecast = theta_forecast.view(batch_size, self.nr_params, -1)
 
         # interpolate function expects (batch, "channels", time)
-        # theta_backcast = theta_backcast.unsqueeze(1)
         theta_backcast = theta_backcast.view(batch_size, self.input_dim, -1)    ## Added SidhartKrishnanQC
 
         # interpolate both backcast and forecast from the thetas
         x_hat = F.interpolate(
-            theta_backcast, size=self.input_chunk_length, mode="linear", align_corners=self.align_corners_downsample
-        )
+            theta_backcast, size=(self.input_chunk_length + 1), mode="linear", align_corners=self.align_corners_downsample
+        )[:,:,:-1]
 
         y_hat = F.interpolate(
-            theta_forecast, size=self.output_chunk_length, mode="linear", align_corners=self.align_corners_downsample
-        ) 
+            theta_forecast, size=(self.output_chunk_length + 1), mode="linear", align_corners=self.align_corners_downsample
+        )[:,:,:-1]
 
         x_hat = torch.reshape(x_hat, (batch_size, self.input_chunk_length * self.input_dim)) ## SidhartKrishnanQC
         # x_hat = x_hat.squeeze(1)  # remove 2nd dim we added before interpolation
@@ -260,12 +346,16 @@ class _Stack(nn.Module):
         pooling_strides: Tuple[Union[int, None]],
         pooling_output_dims: Tuple[Union[int, None]],
         pooling_groups: Tuple[Union[int, None]],
-        n_freq_downsample: Tuple[int],
+        backcast_downsample_freqs: Tuple[int],
+        forecast_downsample_freqs: Tuple[int],
         align_corners_downsample: bool,
         batch_norm: bool,
         dropout: float,
         activation: str,
         pooling_layer_name: Union[str, None],
+        g_type: _GType,
+        expansion_coefficient_dim: int,
+        trend_polynomial_degree: int,
     ):
         """PyTorch module implementing one stack of the N-BEATS architecture that comprises multiple basic blocks.
 
@@ -318,6 +408,9 @@ class _Stack(nn.Module):
         self.input_dim = input_dim
         self.nr_params = nr_params
 
+        self.num_blocks = num_blocks
+        self.num_layers = num_layers
+
         # TODO: leave option to share weights across blocks?
         self.blocks_list = [
             _Block(
@@ -332,7 +425,8 @@ class _Stack(nn.Module):
                 pooling_strides[i],
                 pooling_output_dims[i],
                 pooling_groups[i],
-                n_freq_downsample[i],
+                backcast_downsample_freqs[i],
+                forecast_downsample_freqs[i],
                 align_corners_downsample,
                 batch_norm=(
                     batch_norm and i == 0
@@ -340,6 +434,8 @@ class _Stack(nn.Module):
                 dropout=dropout,
                 activation=activation,
                 pooling_layer_name=pooling_layer_name,
+                g_type=g_type,
+                expansion_coefficient_dim=expansion_coefficient_dim if g_type != _GType.TREND else trend_polynomial_degree,
             )
             for i in range(num_blocks)
         ]
@@ -378,14 +474,18 @@ class _NHiTSModule(PLPastCovariatesModule):
         output_dim: int,
         nr_params: int,
         num_stacks: int,
-        num_blocks: int,
-        num_layers: int,
+        num_blocks: List[int],
+        num_layers: List[int],
         layer_widths: List[int],
+        g_types: List[_GType],
+        expansion_coefficient_dim: int,
+        trend_polynomial_degree: int,
         pooling_kernel_sizes: Tuple[Tuple[Union[int, None]]],
         pooling_strides: Tuple[Tuple[Union[int, None]]],
         pooling_output_dims: Tuple[Tuple[Union[int, None]]],
         pooling_groups: Tuple[Tuple[Union[int, None]]],
-        n_freq_downsample: Tuple[Tuple[int]],
+        backcast_downsample_freqs: Tuple[Tuple[int]],
+        forecast_downsample_freqs: Tuple[Tuple[int]],
         align_corners_downsample: bool,
         batch_norm: bool,
         dropout: float,
@@ -459,8 +559,8 @@ class _NHiTSModule(PLPastCovariatesModule):
                 self.input_chunk_length_multi,
                 self.static_input_dim,
                 self.output_chunk_length_multi,
-                num_blocks,
-                num_layers,
+                num_blocks[i],
+                num_layers[i],
                 layer_widths[i],
                 input_dim,
                 nr_params,
@@ -468,14 +568,18 @@ class _NHiTSModule(PLPastCovariatesModule):
                 pooling_strides[i],
                 pooling_output_dims[i],
                 pooling_groups[i],
-                n_freq_downsample[i],
+                backcast_downsample_freqs[i],
+                forecast_downsample_freqs[i],
                 align_corners_downsample,
                 batch_norm=(
                     batch_norm and i == 0
                 ),  # batch norm only on first block of first stack
                 dropout=dropout,
                 activation=activation,
-                MaxPool1d=MaxPool1d,
+                pooling_layer_name=pooling_layer_name,
+                g_type=g_types[i],
+                expansion_coefficient_dim=expansion_coefficient_dim,
+                trend_polynomial_degree=trend_polynomial_degree,
             )
             for i in range(num_stacks)
         ]
@@ -493,7 +597,8 @@ class _NHiTSModule(PLPastCovariatesModule):
         # if x1, x2,... y1, y2... is one multivariate ts containing x and y, and a1, a2... one covariate ts
         # we reshape into x1, y1, a1, x2, y2, a2... etc
         x = torch.reshape(x, (x.shape[0], self.input_chunk_length_multi * self.input_dim, 1))
-        x_static = torch.reshape(x_static, (x_static.shape[0], self.static_input_dim))
+        if x_static is not None:
+            x_static = torch.reshape(x_static, (x_static.shape[0], self.static_input_dim))
         # squeeze last dimension (because model is univariate)
         x = x.squeeze(dim=2)
 
@@ -533,14 +638,20 @@ class NHiTSModel(PastCovariatesTorchModel):
         self,
         input_chunk_length: int,
         output_chunk_length: int,
+        g_types: List[_GType],
+        expansion_coefficient_dim: int = 8,
+        trend_polynomial_degree: int = 6,
         num_stacks: int = 3,
-        num_blocks: int = 1,
-        num_layers: int = 2,
+        num_blocks: Union[int, List[int]] = 1,
+        num_layers: Union[int, List[int]] = 2,
         layer_widths: Union[int, List[int]] = 512,
         pooling_kernel_sizes: Optional[Tuple[Tuple[Union[int, None]]]] = None,
         pooling_strides: Optional[Tuple[Tuple[Union[int, None]]]] = None,
+        pooling_output_dims: Optional[Tuple[Tuple[Union[int, None]]]] = None,
+        pooling_groups: Optional[Tuple[Tuple[Union[int, None]]]] = None,
         min_pooling_reduction: Optional[int] = None,
-        n_freq_downsample: Optional[Tuple[Tuple[int]]] = None,
+        backcast_downsample_freqs: Optional[Tuple[Tuple[int]]] = None,
+        forecast_downsample_freqs: Optional[Tuple[Tuple[int]]] = None,
         min_downsample_reduction: Optional[int] = None,
         align_corners_downsample: bool = True,
         dropout: float = 0.1,
@@ -743,9 +854,28 @@ class NHiTSModel(PastCovariatesTorchModel):
         self._uses_static_covariates = True
 
         raise_if_not(
+            isinstance(num_blocks, int) or len(num_blocks) == num_stacks,
+            "Please pass an integer or a list of integers with length `num_stacks`"
+            "as value for the `num_blocks` argument.",
+            logger,
+        )
+        raise_if_not(
+            isinstance(num_layers, int) or len(num_layers) == num_stacks,
+            "Please pass an integer or a list of integers with length `num_stacks`"
+            "as value for the `num_layers` argument.",
+            logger,
+        )
+        raise_if_not(
             isinstance(layer_widths, int) or len(layer_widths) == num_stacks,
             "Please pass an integer or a list of integers with length `num_stacks`"
             "as value for the `layer_widths` argument.",
+            logger,
+        )
+
+        raise_if_not(
+            isinstance(g_types, _GType) or len(g_types) == num_stacks,
+            "Please pass a _GType or a list of _GType's with length `num_stacks`"
+            "as value for the `g_types` argument.",
             logger,
         )
 
@@ -753,14 +883,17 @@ class NHiTSModel(PastCovariatesTorchModel):
         self.num_blocks = num_blocks
         self.num_layers = num_layers
         self.layer_widths = layer_widths
+
+        self.g_types = g_types
+        self.expansion_coefficient_dim = expansion_coefficient_dim
+        self.trend_polynomial_degree = trend_polynomial_degree
+
         self.activation = activation
         self.pooling_layer_name = pooling_layer_name
 
         if pooling_layer_name is not None:
             if pooling_kernel_sizes is None:
                 pooling_kernel_sizes = "geometric"
-            if pooling_strides is None:
-                pooling_strides = "one"
 
         # Currently batch norm is not an option as it seems to perform badly
         self.batch_norm = False
@@ -771,7 +904,10 @@ class NHiTSModel(PastCovariatesTorchModel):
         sizes = self._prepare_pooling_downsampling(
             pooling_kernel_sizes,
             pooling_strides,
-            n_freq_downsample,
+            pooling_output_dims,
+            pooling_groups,
+            backcast_downsample_freqs,
+            forecast_downsample_freqs,
             self.input_chunk_length,
             self.output_chunk_length,
             num_blocks,
@@ -779,11 +915,19 @@ class NHiTSModel(PastCovariatesTorchModel):
             min_pooling_reduction,
             min_downsample_reduction,
         )
-        (self.pooling_kernel_sizes, self.pooling_strides), self.n_freq_downsample = sizes
+        self.pooling_kernel_sizes, self.pooling_strides, self.pooling_output_dims, self.pooling_groups = sizes[0] 
+        self.backcast_downsample_freqs, self.forecast_downsample_freqs = sizes[1]
         self.align_corners_downsample = align_corners_downsample    ## Added by SidhartKrishnanQC
 
+        if isinstance(num_blocks, int):
+            self.num_blocks = [num_blocks] * self.num_stacks
+        if isinstance(num_layers, int):
+            self.num_layers = [num_layers] * self.num_stacks
         if isinstance(layer_widths, int):
             self.layer_widths = [layer_widths] * self.num_stacks
+
+        if isinstance(g_types, _GType):
+            self.g_types = [g_types] * self.num_stacks
 
     @property
     def supports_multivariate(self) -> bool:
@@ -793,7 +937,10 @@ class NHiTSModel(PastCovariatesTorchModel):
     def _prepare_pooling_downsampling(
         pooling_kernel_sizes,
         pooling_strides, 
-        n_freq_downsample, 
+        pooling_output_dims,
+        pooling_groups,
+        backcast_downsample_freqs,
+        forecast_downsample_freqs,
         in_len, 
         out_len, 
         num_blocks, 
@@ -810,8 +957,62 @@ class NHiTSModel(PastCovariatesTorchModel):
                 all([len(i) == num_blocks for i in tup]),
                 f"the length of each tuple in {name} must be `num_blocks={num_blocks}`",
             )
-        min_pooling_reduction = min_pooling_reduction if min_pooling_reduction is not None else 2
         min_downsample_reduction = min_downsample_reduction if min_downsample_reduction is not None else 2
+
+        def generate_downsample_freqs(n_freq_downsample, name):
+            if isinstance(n_freq_downsample, List):
+                n_freq_downsample = tuple(n_freq_downsample)
+            if isinstance(n_freq_downsample, Tuple) and isinstance(n_freq_downsample[0], int):
+                n_freq_downsample = tuple(
+                    (v,) * num_blocks
+                    for v in n_freq_downsample
+                )
+
+            if n_freq_downsample is None:
+                n_freq_downsample = tuple(
+                    (1,) * num_blocks
+                    for _ in range(num_stacks)
+                )
+                logger.info(
+                    f"(N-HiTS): Using automatic downsampling coefficients: {n_freq_downsample}."
+                )
+            elif n_freq_downsample == "geometric":
+                # go from out_len/2 to 1 geometrically in num_stacks steps:
+                max_v = max(out_len // min_downsample_reduction, 1)
+                n_freq_downsample = tuple(
+                    (int(v),) * num_blocks
+                    for v in np.geomspace(max_v, 1, num_stacks)
+                )
+                logger.info(
+                    f"(N-HiTS): Using automatic downsampling coefficients: {n_freq_downsample}."
+                )
+            elif n_freq_downsample == "linear":
+                # go from out_len/2 to 1 linearly in num_stacks steps:
+                max_v = max(out_len // min_downsample_reduction, 1)
+                n_freq_downsample = tuple(
+                    (int(v),) * num_blocks
+                    for v in np.linspace(max_v, 1, num_stacks)
+                )
+                logger.info(
+                    f"(N-HiTS): Using automatic downsampling coefficients: {n_freq_downsample}."
+                )
+            else:
+                # check provided downsample format
+                _check_sizes(n_freq_downsample, name)
+
+                # check that last value is 1
+                raise_if_not(
+                    n_freq_downsample[-1][-1] == 1,
+                    "the downsampling coefficient of the last block of the last stack must be 1 "
+                    + "(i.e., `n_freq_downsample[-1][-1]`).",
+                )
+            return n_freq_downsample
+        
+        backcast_downsample_freqs = generate_downsample_freqs(backcast_downsample_freqs, "`backcast_downsample_freqs`")
+        forecast_downsample_freqs = generate_downsample_freqs(forecast_downsample_freqs, "`forecast_downsample_freqs`")
+
+
+        min_pooling_reduction = min_pooling_reduction if min_pooling_reduction is not None else 2
 
         if pooling_kernel_sizes is None:
             pooling_kernel_sizes = tuple(
@@ -843,16 +1044,11 @@ class NHiTSModel(PastCovariatesTorchModel):
         else:
             # check provided pooling format
             _check_sizes(pooling_kernel_sizes, "`pooling_kernel_sizes`")
-        
+
         if pooling_strides is None:
             pooling_strides = tuple(
                 (None,) * num_blocks
                 for _ in range(num_stacks)
-            )
-        elif pooling_strides == "kernel":
-            pooling_strides = pooling_kernel_sizes
-            logger.info(
-                f"(N-HiTS): Using automatic pooling strides: {pooling_strides}."
             )
         elif pooling_strides == "one":
             pooling_strides = tuple(
@@ -866,46 +1062,26 @@ class NHiTSModel(PastCovariatesTorchModel):
             # check provided pooling format
             _check_sizes(pooling_strides, "`pooling_strides`")
 
-        if n_freq_downsample is None:
-            n_freq_downsample = tuple(
-                (1,) * num_blocks
+        if pooling_output_dims is None:
+            pooling_output_dims = tuple(
+                (None,) * num_blocks
                 for _ in range(num_stacks)
             )
-            logger.info(
-                f"(N-HiTS): Using automatic downsampling coefficients: {n_freq_downsample}."
-            )
-        elif n_freq_downsample == "geometric":
-            # go from out_len/2 to 1 geometrically in num_stacks steps:
-            max_v = max(out_len // min_downsample_reduction, 1)
-            n_freq_downsample = tuple(
-                (int(v),) * num_blocks
-                for v in np.geomspace(max_v, 1, num_stacks)
-            )
-            logger.info(
-                f"(N-HiTS): Using automatic downsampling coefficients: {n_freq_downsample}."
-            )
-        elif n_freq_downsample == "linear":
-            # go from out_len/2 to 1 linearly in num_stacks steps:
-            max_v = max(out_len // min_downsample_reduction, 1)
-            n_freq_downsample = tuple(
-                (int(v),) * num_blocks
-                for v in np.linspace(max_v, 1, num_stacks)
-            )
-            logger.info(
-                f"(N-HiTS): Using automatic downsampling coefficients: {n_freq_downsample}."
+        else:
+            # check provided pooling format
+            _check_sizes(pooling_output_dims, "`pooling_output_dims`")
+
+        if pooling_groups is None:
+            pooling_groups = tuple(
+                (None,) * num_blocks
+                for _ in range(num_stacks)
             )
         else:
-            # check provided downsample format
-            _check_sizes(n_freq_downsample, "`n_freq_downsample`")
+            # check provided pooling format
+            _check_sizes(pooling_groups, "`pooling_groups`")
 
-            # check that last value is 1
-            raise_if_not(
-                n_freq_downsample[-1][-1] == 1,
-                "the downsampling coefficient of the last block of the last stack must be 1 "
-                + "(i.e., `n_freq_downsample[-1][-1]`).",
-            )
-
-        return (pooling_kernel_sizes, pooling_strides), n_freq_downsample
+        return (pooling_kernel_sizes, pooling_strides, pooling_output_dims, pooling_groups), \
+                (backcast_downsample_freqs, forecast_downsample_freqs)
 
     def _create_model(self, train_sample: Tuple[torch.Tensor]) -> torch.nn.Module:
         # samples are made of (past_target, past_covariates, future_target)
@@ -925,8 +1101,15 @@ class NHiTSModel(PastCovariatesTorchModel):
             num_blocks=self.num_blocks,
             num_layers=self.num_layers,
             layer_widths=self.layer_widths,
+            g_types=self.g_types,
+            expansion_coefficient_dim=self.expansion_coefficient_dim,
+            trend_polynomial_degree=self.trend_polynomial_degree,
             pooling_kernel_sizes=self.pooling_kernel_sizes,
-            n_freq_downsample=self.n_freq_downsample,
+            pooling_strides=self.pooling_strides,
+            pooling_output_dims=self.pooling_output_dims,
+            pooling_groups=self.pooling_groups,
+            backcast_downsample_freqs=self.backcast_downsample_freqs,
+            forecast_downsample_freqs=self.forecast_downsample_freqs,
             align_corners_downsample=self.align_corners_downsample,
             batch_norm=self.batch_norm,
             dropout=self.dropout,
