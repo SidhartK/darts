@@ -33,9 +33,9 @@ ACTIVATIONS = [
 ]
 
 class _GType(Enum):
-    GENERIC = 1
-    TREND = 2
-    SEASONALITY = 3
+    GENERIC = "GENERIC"
+    TREND = "TREND"
+    SEASONALITY = "SEASONALITY"
 
 
 GTypes = NewType("GTypes", _GType)
