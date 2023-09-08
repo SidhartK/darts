@@ -884,7 +884,7 @@ class NHiTSModel(PastCovariatesTorchModel):
         self.num_layers = num_layers
         self.layer_widths = layer_widths
 
-        self.g_types = g_types
+        self.g_types = [_GType(g_type) for g_type in g_types] if not isinstance(g_types, _GType) else _GType(g_types)
         self.expansion_coefficient_dim = expansion_coefficient_dim
         self.trend_polynomial_degree = trend_polynomial_degree
 
@@ -1013,6 +1013,13 @@ class NHiTSModel(PastCovariatesTorchModel):
 
 
         min_pooling_reduction = min_pooling_reduction if min_pooling_reduction is not None else 2
+        if isinstance(pooling_kernel_sizes, List):
+            pooling_kernel_sizes = tuple(pooling_kernel_sizes)
+        if isinstance(pooling_kernel_sizes, Tuple) and isinstance(pooling_kernel_sizes[0], int):
+            pooling_kernel_sizes = tuple(
+                (v,) * num_blocks
+                for v in pooling_kernel_sizes
+            )
 
         if pooling_kernel_sizes is None:
             pooling_kernel_sizes = tuple(
@@ -1117,4 +1124,5 @@ class NHiTSModel(PastCovariatesTorchModel):
             pooling_layer_name=self.pooling_layer_name,
             **self.pl_module_params,
         )
+
 
